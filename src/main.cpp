@@ -78,7 +78,6 @@ void camera_receive_thread(const char* url) {
                     {
                         std::lock_guard<std::mutex> lock(frame_queue_mutex);
                         frame_queue.push(rgb);
-                        printf("Got frame\n");
                     }
                 }
             }
@@ -158,10 +157,38 @@ int main()
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        ImGuiStyle& style = ImGui::GetStyle();
+        style.TabRounding = 8.f;
+        style.FrameRounding = 8.f;
+        style.GrabRounding = 8.f;
+        style.WindowRounding = 8.f;
+        style.PopupRounding = 8.f;
+
         // --- Display texture in ImGui ---
         ImGui::Begin("Camera");
-        if (tex)
-            ImGui::Image((ImTextureID)(intptr_t)tex, ImVec2(640, 480));
+        if (tex) {
+            constexpr float aspect_ratio = 16.0f / 9.0f;
+
+            ImVec2 size = ImGui::GetContentRegionAvail();
+            ImVec2 draw_size;
+
+            if ((size.x / size.y) > aspect_ratio) {
+                draw_size.y = size.y;
+                draw_size.x = draw_size.y * aspect_ratio;
+            }
+            else {
+                draw_size.x = size.x;
+                draw_size.y = draw_size.x / aspect_ratio;
+            }
+
+            ImVec2 cursor = ImGui::GetCursorPos();
+            ImGui::SetCursorPos(ImVec2(
+                cursor.x + (size.x - draw_size.x) * 0.5f,
+                cursor.y + (size.y - draw_size.y) * 0.5f
+            ));
+
+            ImGui::Image((ImTextureID)(intptr_t)tex, draw_size);
+        }
         ImGui::End();
 
         // Render
