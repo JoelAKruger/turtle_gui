@@ -17,6 +17,9 @@ extern "C" {
 #include <libavutil/imgutils.h>
 }
 
+#include <opencv2/opencv.hpp>
+#include <onnxruntime_cxx_api.h>
+
 std::queue<AVFrame*> frame_queue;
 std::mutex frame_queue_mutex;
 
@@ -91,13 +94,82 @@ void camera_receive_thread(const char* url) {
     avcodec_free_context(&codec_context);
     avformat_close_input(&format_context);
 }
-
-void run_gui()
+struct inference_detection
 {
-    // UI
-    ImGui::Begin("Hello, world!");
-    ImGui::Text("This is Dear ImGui running on GLFW.");
-    ImGui::End();
+    float Confidence; 
+    float X, Y, W, H; 
+    int ClassID;
+};
+
+static std::vector<inference_detection>
+RunInference(cv::dnn::Net& Network, cv::Size ModelShape, const cv::Mat& Frame, int ClassCount)
+{
+    cv::Mat Blob;
+    cv::dnn::blobFromImage(Frame, Blob, 1.0f / 255.0f, ModelShape, cv::Scalar(), true, false);
+    
+    Network.setInput(Blob);
+    
+    std::vector<cv::Mat> Outputs;
+    Network.forward(Outputs, Network.getUnconnectedOutLayersNames());
+    
+    int Rows = Outputs[0].size[2];
+    int Dimensions = Outputs[0].size[1];
+    
+    float XScale = (float)Frame.cols / ModelShape.width;
+    float YScale = (float)Frame.rows / ModelShape.height;
+    
+    Outputs[0] = Outputs[0].reshape(1, Dimensions);
+    cv::transpose(Outputs[0], Outputs[0]);
+    float* Data = (float*)Outputs[0].data;
+    
+    std::vector<inference_detection> Detections;
+    
+    std::vector<float> Confidences;
+    std::vector<cv::Rect> Boxes;
+    
+    float Threshold = 0.1f;
+    for (int Row = 0; Row < Rows; Row++)
+    {
+        float* ClassesScores = Data + 4;
+        cv::Mat Scores(1, ClassCount, CV_32FC1, ClassesScores);
+        cv::Point ClassID;
+        double MaxClassScore;
+
+        cv::minMaxLoc(Scores, 0, &MaxClassScore, 0, &ClassID);
+        
+        if (MaxClassScore > Threshold)
+        {
+            float X = Data[0] * XScale;
+            float Y = Data[1] * YScale;
+            float W = Data[2] * XScale;
+            float H = Data[3] * YScale;
+            
+            inference_detection Inference = {
+                (float)MaxClassScore, X, Y, W, H, ClassID.x
+            };
+            Detections.push_back(Inference);
+            
+            Boxes.emplace_back((int)(X - 0.5f * W), (int)(Y - 0.5f * H), (int)W, (int)H);
+            Confidences.push_back((float)MaxClassScore);
+        }
+        
+        Data += Dimensions;
+    }
+    
+    float NMSThreshold = 0.4f;
+    
+    //Run non-maximum suppression to eliminate duplicate detections
+    std::vector<int> NMSResult;
+    cv::dnn::NMSBoxes(Boxes, Confidences, Threshold, NMSThreshold, NMSResult);
+    
+    std::vector<inference_detection> Result;
+    
+    for (int Index : NMSResult)
+    {
+        Result.push_back(Detections[Index]);
+    }
+    
+    return Result;
 }
 
 int main()
@@ -109,7 +181,7 @@ int main()
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(800, 600, "Dear ImGui + GLFW", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(800, 600, "Turtle", NULL, NULL);
     assert(window);
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
@@ -125,8 +197,19 @@ int main()
 
     const char* url = "udp://0.0.0.0:1234";
     std::thread recv(camera_receive_thread, url);
-    GLuint tex = 0;
-    glGenTextures(1, &tex);
+    GLuint camera_texture = 0;
+    glGenTextures(1, &camera_texture);
+
+    GLuint model_output_texture = 0;
+    glGenTextures(1, &model_output_texture);
+
+    char model_path[256] = {};
+    
+    cv::dnn::Net onnx_network;
+    std::string onnx_result;
+    cv::Size onnx_model_shape = {640, 640};
+
+    bool should_run_model = false;
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -137,18 +220,47 @@ int main()
             std::lock_guard<std::mutex> lock(frame_queue_mutex);
             while (!frame_queue.empty()) {
                 if (latest_frame)
-                    av_frame_free(&latest_frame);  // free old frames
+                    av_frame_free(&latest_frame);
                 latest_frame = frame_queue.front();
                 frame_queue.pop();
             }
         }
 
         if (latest_frame) {
-            glBindTexture(GL_TEXTURE_2D, tex);
+            glBindTexture(GL_TEXTURE_2D, camera_texture);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, latest_frame->width, latest_frame->height, 0,
                         GL_RGB, GL_UNSIGNED_BYTE, latest_frame->data[0]);
+
+            if (should_run_model) {
+                cv::Mat frame(
+                    latest_frame->height,
+                    latest_frame->width,
+                    CV_8UC3,
+                    latest_frame->data[0],
+                    latest_frame->linesize[0]
+                );
+
+                frame = frame.clone();
+
+                std::vector<inference_detection> inferences = RunInference(onnx_network, onnx_model_shape, frame, 4);
+
+                for (inference_detection& inference : inferences) {
+                    cv::Rect rect = cv::Rect((int)(inference.X - 0.5f * inference.W), (int)(inference.Y - 0.5f * inference.H), (int)inference.W, (int)inference.H);
+                    cv::rectangle(frame, rect, cv::Scalar(1.0f), 2);
+                    printf("Detection\n");
+                }
+
+                // Upload to OpenGL
+                glBindTexture(GL_TEXTURE_2D, model_output_texture);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, frame.cols, frame.rows, 0, GL_RGB, GL_UNSIGNED_BYTE, frame.data);
+
+                should_run_model = false;
+            }
+
             av_frame_free(&latest_frame);
         }
 
@@ -166,7 +278,7 @@ int main()
 
         // --- Display texture in ImGui ---
         ImGui::Begin("Camera");
-        if (tex) {
+        if (camera_texture) {
             constexpr float aspect_ratio = 16.0f / 9.0f;
 
             ImVec2 size = ImGui::GetContentRegionAvail();
@@ -187,8 +299,56 @@ int main()
                 cursor.y + (size.y - draw_size.y) * 0.5f
             ));
 
-            ImGui::Image((ImTextureID)(intptr_t)tex, draw_size);
+            ImGui::Image((ImTextureID)(intptr_t)camera_texture, draw_size);
         }
+        ImGui::End();
+
+        ImGui::Begin("Model");
+        ImGui::Text("Model path: ");
+        ImGui::InputText("", model_path, sizeof(model_path));
+        ImGui::SameLine();
+        if (ImGui::Button("Open")) {
+            try {
+                onnx_network = cv::dnn::readNetFromONNX(model_path);
+                onnx_result = std::string("Using model: ") + model_path;
+            }
+            catch (cv::Exception exception) {
+                onnx_result = exception.err;
+            }
+
+        }
+
+        ImGui::Text("%s", onnx_result.c_str());
+        ImGui::SameLine();
+        if (ImGui::Button("Run Model")) {
+            should_run_model = true;
+        }
+
+        ImGui::Text("Model Output:");
+        if (model_output_texture) {
+            constexpr float aspect_ratio = 16.0f / 9.0f;
+
+            ImVec2 size = ImGui::GetContentRegionAvail();
+            ImVec2 draw_size;
+
+            if ((size.x / size.y) > aspect_ratio) {
+                draw_size.y = size.y;
+                draw_size.x = draw_size.y * aspect_ratio;
+            }
+            else {
+                draw_size.x = size.x;
+                draw_size.y = draw_size.x / aspect_ratio;
+            }
+
+            ImVec2 cursor = ImGui::GetCursorPos();
+            ImGui::SetCursorPos(ImVec2(
+                cursor.x + (size.x - draw_size.x) * 0.5f,
+                cursor.y + (size.y - draw_size.y) * 0.5f
+            ));
+
+            ImGui::Image((ImTextureID)(intptr_t)model_output_texture, draw_size);
+        }
+
         ImGui::End();
 
         // Render
@@ -196,14 +356,12 @@ int main()
         int display_w, display_h;
         glfwGetFramebufferSize(window, &display_w, &display_h);
         glViewport(0, 0, display_w, display_h);
-        glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+        glClearColor(0.2f, 0.2f, 0.2f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         glfwSwapBuffers(window);
     }
-
-    glDeleteTextures(1, &tex);
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();

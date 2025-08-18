@@ -13,14 +13,16 @@ pkgs.stdenv.mkDerivation {
     pkgs.libGL
     pkgs.pkg-config
     pkgs.ffmpeg_6
+    pkgs.opencv4
+    pkgs.onnxruntime
   ];
 
   buildPhase = ''
     g++ -O0 -g src/main.cpp -o turtle_gui \
       -limgui \
-      $(pkg-config --libs glfw3) \
+      $(pkg-config --cflags --libs opencv4 glfw3 libonnxruntime) \
       -lGL \
-      -lavformat -lavcodec -lavutil -lswscale
+      -lavformat -lavcodec -lavutil -lswscale \
   '';
 
   installPhase = ''
