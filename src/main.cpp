@@ -332,7 +332,13 @@ int main()
 
                 frame = frame.clone();
 
-                std::vector<inference_detection> inferences = RunInference(onnx_network, onnx_model_shape, frame, class_names.size());
+                std::vector<inference_detection> inferences;
+                
+                try {
+                    inferences = RunInference(onnx_network, onnx_model_shape, frame, class_names.size());
+                }
+                catch (cv::Exception exception) {
+                }
 
                 for (inference_detection& inference : inferences) {
                     cv::Rect rect = cv::Rect((int)(inference.X - 0.5f * inference.W), (int)(inference.Y - 0.5f * inference.H), (int)inference.W, (int)inference.H);
