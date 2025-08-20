@@ -21,17 +21,183 @@ extern "C" {
 #include <opencv2/opencv.hpp>
 #include <onnxruntime_cxx_api.h>
 
-std::queue<AVFrame*> frame_queue;
-std::mutex frame_queue_mutex;
+std::array<const char*, 80> class_names = {
+    "person",
+    "bicycle",
+    "car",
+    "motorcycle",
+    "airplane",
+    "bus",
+    "train",
+    "truck",
+    "boat",
+    "traffic light",
+    "fire hydrant",
+    "stop sign",
+    "parking meter",
+    "bench",
+    "bird",
+    "cat",
+    "dog",
+    "horse",
+    "sheep",
+    "cow",
+    "elephant",
+    "bear",
+    "zebra",
+    "giraffe",
+    "backpack",
+    "umbrella",
+    "handbag",
+    "tie",
+    "suitcase",
+    "frisbee",
+    "skis",
+    "snowboard",
+    "sports ball",
+    "kite",
+    "baseball bat",
+    "baseball glove",
+    "skateboard",
+    "surfboard",
+    "tennis racket",
+    "bottle",
+    "wine glass",
+    "cup",
+    "fork",
+    "knife",
+    "spoon",
+    "bowl",
+    "banana",
+    "apple",
+    "sandwich",
+    "orange",
+    "brocolli",
+    "carrot",
+    "hot dog",
+    "pizza",
+    "donut",
+    "cake",
+    "chair",
+    "couch",
+    "potted plant",
+    "bed",
+    "dining table",
+    "toilet",
+    "tv",
+    "laptop",
+    "mouse",
+    "remote",
+    "keyboard",
+    "cell phone",
+    "microwave",
+    "oven",
+    "toaster",
+    "sink",
+    "refrigerator",
+    "book",
+    "clock",
+    "vase",
+    "scissors",
+    "teddy bear",
+    "hair drier",
+    "toothbrush"
+};
 
-void camera_receive_thread(const char* url) {
+
+struct inference_detection
+{
+    float Confidence; 
+    float X, Y, W, H; 
+    int ClassID;
+};
+
+static std::vector<inference_detection>
+RunInference(cv::dnn::Net& Network, cv::Size ModelShape, const cv::Mat& Frame, int ClassCount, float Threshold)
+{
+    cv::Mat Blob;
+    cv::dnn::blobFromImage(Frame, Blob, 1.0f / 255.0f, ModelShape, cv::Scalar(), true, false);
+    
+    Network.setInput(Blob);
+    
+    std::vector<cv::Mat> Outputs;
+    Network.forward(Outputs, Network.getUnconnectedOutLayersNames());
+    
+    int Rows = Outputs[0].size[2];
+    int Dimensions = Outputs[0].size[1];
+    
+    float XScale = (float)Frame.cols / ModelShape.width;
+    float YScale = (float)Frame.rows / ModelShape.height;
+    
+    Outputs[0] = Outputs[0].reshape(1, Dimensions);
+    cv::transpose(Outputs[0], Outputs[0]);
+    float* Data = (float*)Outputs[0].data;
+    
+    std::vector<inference_detection> Detections;
+    
+    std::vector<float> Confidences;
+    std::vector<cv::Rect> Boxes;
+    
+    for (int Row = 0; Row < Rows; Row++)
+    {
+        float* ClassesScores = Data + 4;
+        cv::Mat Scores(1, ClassCount, CV_32FC1, ClassesScores);
+        cv::Point ClassID;
+        double MaxClassScore;
+
+        cv::minMaxLoc(Scores, 0, &MaxClassScore, 0, &ClassID);
+        
+        if (MaxClassScore > Threshold)
+        {
+            float X = Data[0] * XScale;
+            float Y = Data[1] * YScale;
+            float W = Data[2] * XScale;
+            float H = Data[3] * YScale;
+            
+            inference_detection Inference = {
+                (float)MaxClassScore, X, Y, W, H, ClassID.x
+            };
+            Detections.push_back(Inference);
+            
+            Boxes.emplace_back((int)(X - 0.5f * W), (int)(Y - 0.5f * H), (int)W, (int)H);
+            Confidences.push_back((float)MaxClassScore);
+        }
+        
+        Data += Dimensions;
+    }
+    
+    float NMSThreshold = 0.4f;
+    
+    //Run non-maximum suppression to eliminate duplicate detections
+    std::vector<int> NMSResult;
+    cv::dnn::NMSBoxes(Boxes, Confidences, Threshold, NMSThreshold, NMSResult);
+    
+    std::vector<inference_detection> Result;
+    
+    for (int Index : NMSResult)
+    {
+        Result.push_back(Detections[Index]);
+    }
+    
+    return Result;
+}
+
+struct CameraFeed
+{
+    const char* url = 0;
+    std::queue<AVFrame*> frame_queue;
+    std::mutex frame_queue_mutex;
+};
+
+
+void camera_receive_thread(CameraFeed* camera) {
     avformat_network_init();
     AVFormatContext* format_context = 0;
     AVDictionary *options = NULL;
     av_dict_set(&options, "probesize", "50000000", 0);       // 50 MB
     av_dict_set(&options, "analyzeduration", "10000000", 0); // 10s (in microseconds)
 
-    avformat_open_input(&format_context, url, 0, &options);
+    avformat_open_input(&format_context, camera->url, 0, &options);
     avformat_find_stream_info(format_context, 0);
 
     int video_stream = -1;
@@ -84,8 +250,8 @@ void camera_receive_thread(const char* url) {
 
                     // Put it into your queue
                     {
-                        std::lock_guard<std::mutex> lock(frame_queue_mutex);
-                        frame_queue.push(rgb);
+                        std::lock_guard<std::mutex> lock(camera->frame_queue_mutex);
+                        camera->frame_queue.push(rgb);
                     }
                 }
             }
@@ -99,218 +265,43 @@ void camera_receive_thread(const char* url) {
     avcodec_free_context(&codec_context);
     avformat_close_input(&format_context);
 }
-struct inference_detection
+
+class Turtle
 {
-    float Confidence; 
-    float X, Y, W, H; 
-    int ClassID;
-};
+    //Cameras
+    CameraFeed camera_feed;
+    GLuint camera_texture, model_output_texture;
 
-static std::vector<inference_detection>
-RunInference(cv::dnn::Net& Network, cv::Size ModelShape, const cv::Mat& Frame, int ClassCount)
-{
-    cv::Mat Blob;
-    cv::dnn::blobFromImage(Frame, Blob, 1.0f / 255.0f, ModelShape, cv::Scalar(), true, false);
-    
-    Network.setInput(Blob);
-    
-    std::vector<cv::Mat> Outputs;
-    Network.forward(Outputs, Network.getUnconnectedOutLayersNames());
-    
-    int Rows = Outputs[0].size[2];
-    int Dimensions = Outputs[0].size[1];
-    
-    float XScale = (float)Frame.cols / ModelShape.width;
-    float YScale = (float)Frame.rows / ModelShape.height;
-    
-    Outputs[0] = Outputs[0].reshape(1, Dimensions);
-    cv::transpose(Outputs[0], Outputs[0]);
-    float* Data = (float*)Outputs[0].data;
-    
-    std::vector<inference_detection> Detections;
-    
-    std::vector<float> Confidences;
-    std::vector<cv::Rect> Boxes;
-    
-    float Threshold = 0.1f;
-    for (int Row = 0; Row < Rows; Row++)
-    {
-        float* ClassesScores = Data + 4;
-        cv::Mat Scores(1, ClassCount, CV_32FC1, ClassesScores);
-        cv::Point ClassID;
-        double MaxClassScore;
-
-        cv::minMaxLoc(Scores, 0, &MaxClassScore, 0, &ClassID);
-        
-        if (MaxClassScore > Threshold)
-        {
-            float X = Data[0] * XScale;
-            float Y = Data[1] * YScale;
-            float W = Data[2] * XScale;
-            float H = Data[3] * YScale;
-            
-            inference_detection Inference = {
-                (float)MaxClassScore, X, Y, W, H, ClassID.x
-            };
-            Detections.push_back(Inference);
-            
-            Boxes.emplace_back((int)(X - 0.5f * W), (int)(Y - 0.5f * H), (int)W, (int)H);
-            Confidences.push_back((float)MaxClassScore);
-        }
-        
-        Data += Dimensions;
-    }
-    
-    float NMSThreshold = 0.4f;
-    
-    //Run non-maximum suppression to eliminate duplicate detections
-    std::vector<int> NMSResult;
-    cv::dnn::NMSBoxes(Boxes, Confidences, Threshold, NMSThreshold, NMSResult);
-    
-    std::vector<inference_detection> Result;
-    
-    for (int Index : NMSResult)
-    {
-        Result.push_back(Detections[Index]);
-    }
-    
-    return Result;
-}
-
-int main()
-{
-    int glfw_init_result = glfwInit();
-    assert(glfw_init_result);
-
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-
-    GLFWwindow* window = glfwCreateWindow(800, 600, "Turtle", NULL, NULL);
-    assert(window);
-    glfwMakeContextCurrent(window);
-    glfwSwapInterval(1);
-
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO();
-
-    ImGui::StyleColorsDark();
-
-    ImGui_ImplGlfw_InitForOpenGL(window, true);
-    ImGui_ImplOpenGL3_Init("#version 330");
-
-    const char* url = "udp://0.0.0.0:1234";
-    std::thread recv(camera_receive_thread, url);
-    GLuint camera_texture = 0;
-    glGenTextures(1, &camera_texture);
-
-    GLuint model_output_texture = 0;
-    glGenTextures(1, &model_output_texture);
-
-    char model_path[256] = {};
-    
+    //Yolo model
+    char model_path[256];
     cv::dnn::Net onnx_network;
     std::string onnx_result;
     cv::Size onnx_model_shape = {640, 640};
-
-    std::array<const char*, 80> class_names = {
-        "person",
-        "bicycle",
-        "car",
-        "motorcycle",
-        "airplane",
-        "bus",
-        "train",
-        "truck",
-        "boat",
-        "traffic light",
-        "fire hydrant",
-        "stop sign",
-        "parking meter",
-        "bench",
-        "bird",
-        "cat",
-        "dog",
-        "horse",
-        "sheep",
-        "cow",
-        "elephant",
-        "bear",
-        "zebra",
-        "giraffe",
-        "backpack",
-        "umbrella",
-        "handbag",
-        "tie",
-        "suitcase",
-        "frisbee",
-        "skis",
-        "snowboard",
-        "sports ball",
-        "kite",
-        "baseball bat",
-        "baseball glove",
-        "skateboard",
-        "surfboard",
-        "tennis racket",
-        "bottle",
-        "wine glass",
-        "cup",
-        "fork",
-        "knife",
-        "spoon",
-        "bowl",
-        "banana",
-        "apple",
-        "sandwich",
-        "orange",
-        "brocolli",
-        "carrot",
-        "hot dog",
-        "pizza",
-        "donut",
-        "cake",
-        "chair",
-        "couch",
-        "potted plant",
-        "bed",
-        "dining table",
-        "toilet",
-        "tv",
-        "laptop",
-        "mouse",
-        "remote",
-        "keyboard",
-        "cell phone",
-        "microwave",
-        "oven",
-        "toaster",
-        "sink",
-        "refrigerator",
-        "book",
-        "clock",
-        "vase",
-        "scissors",
-        "teddy bear",
-        "hair drier",
-        "toothbrush"
-    };
-
     bool should_run_model = false;
+    float model_confidence_threshold = 0.5f;
 
-    while (!glfwWindowShouldClose(window)) {
-        glfwPollEvents();
+public:
+    Turtle() {
+        camera_feed.url = "udp://0.0.0.0:1234";
 
-        // --- Get the latest frame ---
+        glGenTextures(1, &camera_texture);
+        glGenTextures(1, &model_output_texture);
+    }
+
+    void start_camera_threads() {
+        std::thread recv(camera_receive_thread, &camera_feed);
+        recv.detach();
+    }
+
+    void receive_frames() {
         AVFrame* latest_frame = nullptr;
         {
-            std::lock_guard<std::mutex> lock(frame_queue_mutex);
-            while (!frame_queue.empty()) {
+            std::lock_guard<std::mutex> lock(camera_feed.frame_queue_mutex);
+            while (!camera_feed.frame_queue.empty()) {
                 if (latest_frame)
                     av_frame_free(&latest_frame);
-                latest_frame = frame_queue.front();
-                frame_queue.pop();
+                latest_frame = camera_feed.frame_queue.front();
+                camera_feed.frame_queue.pop();
             }
         }
 
@@ -335,7 +326,7 @@ int main()
                 std::vector<inference_detection> inferences;
                 
                 try {
-                    inferences = RunInference(onnx_network, onnx_model_shape, frame, class_names.size());
+                    inferences = RunInference(onnx_network, onnx_model_shape, frame, class_names.size(), model_confidence_threshold);
                 }
                 catch (cv::Exception exception) {
                 }
@@ -372,20 +363,9 @@ int main()
 
             av_frame_free(&latest_frame);
         }
+    }
 
-        // Start ImGui frame
-        ImGui_ImplOpenGL3_NewFrame();
-        ImGui_ImplGlfw_NewFrame();
-        ImGui::NewFrame();
-
-        ImGuiStyle& style = ImGui::GetStyle();
-        style.TabRounding = 8.f;
-        style.FrameRounding = 8.f;
-        style.GrabRounding = 8.f;
-        style.WindowRounding = 8.f;
-        style.PopupRounding = 8.f;
-
-        // --- Display texture in ImGui ---
+    void display_camera() {
         ImGui::Begin("Camera");
         if (camera_texture) {
             constexpr float aspect_ratio = 16.0f / 9.0f;
@@ -411,7 +391,9 @@ int main()
             ImGui::Image((ImTextureID)(intptr_t)camera_texture, draw_size);
         }
         ImGui::End();
+    }
 
+    void display_model() {
         ImGui::Begin("Model");
         ImGui::Text("Model path: ");
         ImGui::InputText("", model_path, sizeof(model_path));
@@ -428,6 +410,7 @@ int main()
         }
 
         ImGui::Text("%s", onnx_result.c_str());
+        ImGui::SliderFloat("##xx", &model_confidence_threshold, 0.0f, 1.0f, "Confidence Threshold: %.3f");
         ImGui::SameLine();
         if (ImGui::Button("Run Model")) {
             should_run_model = true;
@@ -459,6 +442,69 @@ int main()
         }
 
         ImGui::End();
+    }
+
+    void display_drive() {
+        ImGui::Begin("Drive");
+        ImGui::Text("Speed");
+        ImGui::SameLine();
+        float velocity = 0.5f;
+        char buf[64];
+        sprintf(buf, "%.2f m/s", velocity);
+        ImGui::ProgressBar(velocity, ImVec2(0.f, 0.f), buf);
+        ImGui::End();
+    }
+    
+    void render() {
+        receive_frames();
+        display_camera();
+        display_model();
+        display_drive();
+    }
+};
+
+int main()
+{
+    int glfw_init_result = glfwInit();
+    assert(glfw_init_result);
+
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    GLFWwindow* window = glfwCreateWindow(800, 600, "Turtle", NULL, NULL);
+    assert(window);
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+
+    ImGui::StyleColorsDark();
+
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 330"); 
+
+    Turtle turtle;
+    turtle.start_camera_threads();
+
+    while (!glfwWindowShouldClose(window)) {
+        glfwPollEvents();
+
+        // Start ImGui frame
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        ImGuiStyle& style = ImGui::GetStyle();
+        style.TabRounding = 8.f;
+        style.FrameRounding = 8.f;
+        style.GrabRounding = 8.f;
+        style.WindowRounding = 8.f;
+        style.PopupRounding = 8.f;
+
+        turtle.render();
 
         // Render
         ImGui::Render();
