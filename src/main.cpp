@@ -196,8 +196,10 @@ void camera_receive_thread(CameraFeed* camera) {
     AVDictionary *options = NULL;
     av_dict_set(&options, "probesize", "50000000", 0);       // 50 MB
     av_dict_set(&options, "analyzeduration", "10000000", 0); // 10s (in microseconds)
+    av_dict_set(&options, "protocol_whitelist", "file,udp,rtp", 0);
 
-    avformat_open_input(&format_context, camera->url, 0, &options);
+    //avformat_open_input(&format_context, camera->url, 0, &options);
+    avformat_open_input(&format_context, "stream.sdp", NULL, &options);
     avformat_find_stream_info(format_context, 0);
 
     int video_stream = -1;
