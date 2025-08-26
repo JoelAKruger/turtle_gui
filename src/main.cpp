@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include <stdio.h>
 #include <assert.h>
 
@@ -6,11 +7,13 @@
 #include <mutex>
 #include <array>
 
+//IMGUI
 #include <GLFW/glfw3.h>
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 
+//FFMPEG
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -18,8 +21,13 @@ extern "C" {
 #include <libavutil/imgutils.h>
 }
 
+//OpenCV
 #include <opencv2/opencv.hpp>
 #include <onnxruntime_cxx_api.h>
+
+//PulseAudio
+#include <pulse/simple.h>
+#include <pulse/error.h>
 
 std::array<const char*, 80> class_names = {
     "person",
@@ -189,7 +197,6 @@ struct CameraFeed
     std::mutex frame_queue_mutex;
 };
 
-
 void camera_receive_thread(CameraFeed* camera) {
     avformat_network_init();
     AVFormatContext* format_context = 0;
@@ -268,11 +275,45 @@ void camera_receive_thread(CameraFeed* camera) {
     avformat_close_input(&format_context);
 }
 
+struct AudioFeed
+{
+    const char* source = 0;
+};
+
+void audio_receive_thread(AudioFeed* audio)
+{
+    int const sample_rate = 48000;
+
+    pa_sample_spec sample_spec = {
+        .format = PA_SAMPLE_S16LE,
+        .rate = sample_rate,
+        .channels = 2
+    };
+
+    int error = 0;
+    pa_simple* conn = pa_simple_new(0, "TurtleGUI", PA_STREAM_RECORD, audio->source, "capture", &sample_spec, 0, 0, &error);
+    assert(conn);
+
+    int const length_seconds = 5;
+    int16_t samples[sample_rate * length_seconds];
+
+    while (true) {
+        int result = pa_simple_read(conn, samples, sizeof(samples), &error);
+        assert(result >= 0);
+
+        //Process audio segments here
+        printf("Audio\n");
+    }
+}
+
 class Turtle
 {
     //Cameras
     CameraFeed camera_feed;
     GLuint camera_texture, model_output_texture;
+
+    //Audio
+    AudioFeed audio_feed;
 
     //Yolo model
     char model_path[256];
@@ -285,14 +326,20 @@ class Turtle
 public:
     Turtle() {
         camera_feed.url = "udp://0.0.0.0:1234";
-
         glGenTextures(1, &camera_texture);
         glGenTextures(1, &model_output_texture);
+
+        audio_feed.source = "rtp-recv.monitor";
     }
 
-    void start_camera_threads() {
-        std::thread recv(camera_receive_thread, &camera_feed);
-        recv.detach();
+    void start_camera_thread() {
+        std::thread camera(camera_receive_thread, &camera_feed);
+        camera.detach();
+    }
+
+    void start_audio_thread() {
+        std::thread audio(audio_receive_thread, &audio_feed);
+        audio.detach();
     }
 
     void receive_frames() {
@@ -474,7 +521,7 @@ int main()
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(800, 600, "Turtle", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(1280, 720, "Turtle", NULL, NULL);
     assert(window);
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
@@ -489,7 +536,8 @@ int main()
     ImGui_ImplOpenGL3_Init("#version 330"); 
 
     Turtle turtle;
-    turtle.start_camera_threads();
+    turtle.start_camera_thread();
+    //turtle.start_audio_thread();
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();

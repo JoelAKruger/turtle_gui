@@ -15,6 +15,7 @@ pkgs.stdenv.mkDerivation {
     pkgs.ffmpeg_6
     pkgs.opencv4
     pkgs.onnxruntime
+    pkgs.pulseaudio
   ];
 
   buildPhase = ''
@@ -22,7 +23,7 @@ pkgs.stdenv.mkDerivation {
       -limgui \
       $(pkg-config --cflags --libs opencv4 glfw3 libonnxruntime) \
       -lGL \
-      -lavformat -lavcodec -lavutil -lswscale \
+      -lavformat -lavcodec -lavutil -lswscale -lpulse-simple \
   '';
 
   installPhase = ''
