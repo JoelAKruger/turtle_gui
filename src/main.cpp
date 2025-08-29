@@ -273,6 +273,8 @@ void camera_receive_thread(CameraFeed* camera) {
     av_packet_free(&packet);
     avcodec_free_context(&codec_context);
     avformat_close_input(&format_context);
+
+    printf("Stream stopped\n");
 }
 
 struct AudioFeed
@@ -330,6 +332,8 @@ public:
         glGenTextures(1, &model_output_texture);
 
         audio_feed.source = "rtp-recv.monitor";
+
+        model_path[0] = 0;
     }
 
     void start_camera_thread() {
