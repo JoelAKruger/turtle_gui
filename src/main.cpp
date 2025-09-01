@@ -7,7 +7,7 @@
 #include <mutex>
 #include <array>
 
-//IMGUI
+//Imgui
 #include <GLFW/glfw3.h>
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
@@ -28,6 +28,47 @@ extern "C" {
 //PulseAudio
 #include <pulse/simple.h>
 #include <pulse/error.h>
+
+//STB image
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
+GLuint load_texture(const char* filename) {
+    int width = 0, height = 0, nrChannels = 0;
+    unsigned char* data = stbi_load(filename, &width, &height, &nrChannels, 0);
+    if (!data) {
+        printf("Failed to load image: %s", filename);
+        return 0;
+    }
+
+    GLenum format;
+    if (nrChannels == 1)
+        format = GL_RED;
+    else if (nrChannels == 3)
+        format = GL_RGB;
+    else if (nrChannels == 4)
+        format = GL_RGBA;
+    else {
+        stbi_image_free(data);
+        printf("Unsupported channel count: %d", nrChannels);
+        return 0;
+    }
+
+    GLuint textureID;
+    glGenTextures(1, &textureID);
+    glBindTexture(GL_TEXTURE_2D, textureID);
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format,
+                 GL_UNSIGNED_BYTE, data);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    stbi_image_free(data);
+
+    return textureID;
+}
 
 std::array<const char*, 80> class_names = {
     "person",
@@ -313,6 +354,8 @@ class Turtle
     //Cameras
     CameraFeed camera_feed;
     GLuint camera_texture, model_output_texture;
+    GLuint drive_texture;
+    GLuint drive_overlay_texture;
 
     //Audio
     AudioFeed audio_feed;
@@ -332,6 +375,9 @@ public:
         glGenTextures(1, &model_output_texture);
 
         audio_feed.source = "rtp-recv.monitor";
+
+        drive_texture = load_texture("src/drive.jpg");
+        drive_overlay_texture = load_texture("src/drive_overlay.png");
 
         model_path[0] = 0;
     }
@@ -498,13 +544,31 @@ public:
     }
 
     void display_drive() {
+        float velocity = 0.5f + 0.5f * sinf(ImGui::GetTime());
+        float max_velocity = 1.0f;
+
         ImGui::Begin("Drive");
         ImGui::Text("Speed");
         ImGui::SameLine();
-        float velocity = 0.5f;
         char buf[64];
         sprintf(buf, "%.2f m/s", velocity);
         ImGui::ProgressBar(velocity, ImVec2(0.f, 0.f), buf);
+
+        ImVec2 pos = ImGui::GetCursorScreenPos();
+        ImVec2 size = ImVec2(600, 600);
+
+        //Base
+        ImGui::GetWindowDrawList()->AddImage((ImTextureID)(intptr_t)drive_texture, pos, ImVec2(pos.x + size.x, pos.y + size.y));
+
+        ImGui::GetWindowDrawList()->AddImageQuad((ImTextureID)(intptr_t)drive_texture, ImVec2(100, 200), ImVec2(200, 100), ImVec2(100, 0), ImVec2(0, 100), ImVec2(0.0f, 1.0f), ImVec2(1.0f, 1.0f), ImVec2(1.0f, 0.0f), ImVec2(0.0f, 0.0f), 0xFFFFFFFF);
+
+
+        //Overlay
+        ImGui::GetWindowDrawList()->AddImage((ImTextureID)drive_overlay_texture, pos, ImVec2(pos.x + size.x, pos.y + size.y),
+            ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, 255 * (velocity / max_velocity)));
+
+        ImGui::Dummy(size); // reserve the layout space so ImGui knows something is here
+
         ImGui::End();
     }
     
@@ -540,7 +604,7 @@ int main()
     ImGui_ImplOpenGL3_Init("#version 330"); 
 
     Turtle turtle;
-    turtle.start_camera_thread();
+    //turtle.start_camera_thread();
     //turtle.start_audio_thread();
 
     while (!glfwWindowShouldClose(window)) {
