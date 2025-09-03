@@ -604,8 +604,8 @@ int main()
     ImGui_ImplOpenGL3_Init("#version 330"); 
 
     Turtle turtle;
-    //turtle.start_camera_thread();
-    //turtle.start_audio_thread();
+    // turtle.start_camera_thread();
+    turtle.start_audio_thread();
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
