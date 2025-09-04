@@ -7,6 +7,10 @@
 #include <mutex>
 #include <array>
 
+#include <algorithm>
+#include <numeric>
+#include <cmath>
+
 //Imgui
 #include <GLFW/glfw3.h>
 #include <imgui.h>
@@ -238,7 +242,8 @@ struct CameraFeed
     std::mutex frame_queue_mutex;
 };
 
-void camera_receive_thread(CameraFeed* camera) {
+void camera_receive_thread(CameraFeed* camera) 
+{
     avformat_network_init();
     AVFormatContext* format_context = 0;
     AVDictionary *options = NULL;
@@ -320,33 +325,132 @@ void camera_receive_thread(CameraFeed* camera) {
 
 struct AudioFeed
 {
-    const char* source = 0;
+    const char* source = "rtp://0.0.0.0:4444";
+    std::vector<float> waveform;
+    std::vector<float> spectrum;
+    std::mutex audio_mutex;
+    int sample_rate = 8000;  // Match your FFmpeg streaming rate
+    static constexpr int buffer_size = 8000;  // 1 second of audio at 8kHz
+    static constexpr int fft_size = 512;
+    int write_pos = 0;
+    
+    // update initial params in constructor using initial params
+    AudioFeed() 
+    {
+        waveform.resize(buffer_size, 0.0f);
+        spectrum.resize(fft_size / 2, 0.0f);
+    }
 };
 
 void audio_receive_thread(AudioFeed* audio)
 {
-    int const sample_rate = 48000;
+    avformat_network_init();
+    AVFormatContext* format_context = 0;
+    AVDictionary *options = NULL;
+    av_dict_set(&options, "probesize", "50000000", 0);       // 50 MB
+    av_dict_set(&options, "analyzeduration", "10000000", 0); // 10s (in microseconds)
+    av_dict_set(&options, "protocol_whitelist", "file,udp,rtp", 0);
 
-    pa_sample_spec sample_spec = {
-        .format = PA_SAMPLE_S16LE,
-        .rate = sample_rate,
-        .channels = 2
-    };
+    //avformat_open_input(&format_context, camera->url, 0, &options);
+    avformat_open_input(&format_context, "rtp://0.0.0.0:4444", NULL, &options);
+    avformat_find_stream_info(format_context, 0);
 
-    int error = 0;
-    pa_simple* conn = pa_simple_new(0, "TurtleGUI", PA_STREAM_RECORD, audio->source, "capture", &sample_spec, 0, 0, &error);
-    assert(conn);
-
-    int const length_seconds = 5;
-    int16_t samples[sample_rate * length_seconds];
-
-    while (true) {
-        int result = pa_simple_read(conn, samples, sizeof(samples), &error);
-        assert(result >= 0);
-
-        //Process audio segments here
-        printf("Audio\n");
+    int audio_stream = -1;
+    for (unsigned i = 0; i < format_context->nb_streams; i++) {
+        if (format_context->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            audio_stream = i;
+        }
     }
+    assert(audio_stream >= 0);
+
+    const AVCodec* codec = avcodec_find_decoder(format_context->streams[audio_stream]->codecpar->codec_id);
+    AVCodecContext* codec_context = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(codec_context, format_context->streams[audio_stream]->codecpar);
+    avcodec_open2(codec_context, codec, 0);
+
+    AVPacket* packet = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+
+    printf("Audio stream opened: %d Hz, %d channels\n", codec_context->sample_rate, codec_context->channels);
+
+    while (av_read_frame(format_context, packet) >= 0) {
+        if (packet->stream_index == audio_stream) {
+            if (avcodec_send_packet(codec_context, packet) == 0) {
+                while (avcodec_receive_frame(codec_context, frame) == 0) {
+                    // Process audio frame
+                    int samples_per_channel = frame->nb_samples;
+                    // printf("samples_per_channel: %i", frame->nb_samples);
+                    
+                    // Convert audio data to float and store in circular buffer
+                    {
+                        std::lock_guard<std::mutex> lock(audio->audio_mutex);
+                        
+                        for (int i = 0; i < samples_per_channel; i++) {
+                            float sample = 0.0f;
+                            printf("format: %i", frame->format);
+                            // Handle different audio formats
+                            if (frame->format == AV_SAMPLE_FMT_S16P) {
+                                int16_t* data = (int16_t*)frame->data[0];
+                                sample = data[i] / 32768.0f;
+                            } else if (frame->format == AV_SAMPLE_FMT_S16) {
+                                int16_t* data = (int16_t*)frame->data[0];
+                                sample = data[i] / 32768.0f;
+                            } else if (frame->format == AV_SAMPLE_FMT_S32) {
+                                int32_t* data = (int32_t*)frame->data[0];
+                                sample = data[i] / 2147483648.0f;
+                            } else if (frame->format == AV_SAMPLE_FMT_FLT) {
+                                float* data = (float*)frame->data[0];
+                                sample = data[i];
+                            }
+                            
+                            // Store in circular buffer
+                            audio->waveform[audio->write_pos] = sample;
+                            audio->write_pos = (audio->write_pos + 1) % AudioFeed::buffer_size;
+                        }
+                        
+                        // Calculate spectrum periodically
+                        static int spectrum_counter = 0;
+                        spectrum_counter += samples_per_channel;
+                        if (spectrum_counter >= AudioFeed::fft_size) {
+                            spectrum_counter = 0;
+                            
+                            // Get recent samples for FFT
+                            std::vector<float> fft_input(AudioFeed::fft_size);
+                            for (int i = 0; i < AudioFeed::fft_size; i++) {
+                                int pos = (audio->write_pos - AudioFeed::fft_size + i + AudioFeed::buffer_size) % AudioFeed::buffer_size;
+                                fft_input[i] = audio->waveform[pos];
+                            }
+                            
+                            // simple fft
+                            int n = fft_input.size();
+                            if (n <= 1) return;
+                            
+                            // Simple magnitude spectrum calculation using DFT
+                            audio->spectrum.resize(n / 2);
+                            for (int k = 0; k < n / 2; k++) {
+                                float real = 0, imag = 0;
+                                for (int i = 0; i < n; i++) {
+                                    float angle = -2.0f * M_PI * k * i / n;
+                                    real += fft_input[i] * cos(angle);
+                                    imag += fft_input[i] * sin(angle);
+                                }
+                                audio->spectrum[k] = sqrt(real * real + imag * imag);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        av_packet_unref(packet);
+    }
+    
+    // Cleanup
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+    avcodec_free_context(&codec_context);
+    avformat_close_input(&format_context);
+    
+    printf("Audio stream stopped\n");
 }
 
 class Turtle
@@ -571,12 +675,77 @@ public:
 
         ImGui::End();
     }
+
+    void display_audio() {
+        ImGui::Begin("Audio");
+        
+        // Waveform display
+        ImGui::Text("Waveform");
+        
+        std::vector<float> display_waveform;
+        float rms_level = 0.0f;
+        
+        {
+            std::lock_guard<std::mutex> lock(audio_feed.audio_mutex);
+            
+            // Get recent waveform data for display (last 1000 samples)
+            int display_samples = std::min(1000, (int)audio_feed.waveform.size());
+            display_waveform.resize(display_samples);
+            
+            for (int i = 0; i < display_samples; i++) {
+                int pos = (audio_feed.write_pos - display_samples + i + AudioFeed::buffer_size) % AudioFeed::buffer_size;
+                display_waveform[i] = audio_feed.waveform[pos];
+                rms_level += display_waveform[i] * display_waveform[i];
+            }
+            
+            rms_level = sqrt(rms_level / display_samples);
+        }
+        
+        // Draw waveform
+        if (!display_waveform.empty()) {
+            ImGui::PlotLines("##waveform", display_waveform.data(), display_waveform.size(), 
+                            0, nullptr, -1.0f, 1.0f, ImVec2(0, 100));
+        }
+        
+        // Audio level meter
+        ImGui::Text("Audio Level: %.3f", rms_level);
+        ImGui::ProgressBar(std::min(rms_level * 10.0f, 1.0f), ImVec2(-1, 0), "");
+        
+        // Spectrum display
+        ImGui::Text("Spectrum");
+        
+        std::vector<float> display_spectrum;
+        {
+            std::lock_guard<std::mutex> lock(audio_feed.audio_mutex);
+            display_spectrum = audio_feed.spectrum;
+        }
+        
+        if (!display_spectrum.empty()) {
+            // Normalize spectrum for display
+            float max_val = *std::max_element(display_spectrum.begin(), display_spectrum.end());
+            if (max_val > 0) {
+                for (float& val : display_spectrum) {
+                    val /= max_val;
+                }
+            }
+            
+            ImGui::PlotHistogram("##spectrum", display_spectrum.data(), display_spectrum.size(),
+                            0, nullptr, 0.0f, 1.0f, ImVec2(0, 150));
+        }
+        
+        // Audio info
+        ImGui::Text("Sample Rate: %d Hz", audio_feed.sample_rate);
+        ImGui::Text("Buffer Size: %d samples", AudioFeed::buffer_size);
+        
+        ImGui::End();
+    }
     
     void render() {
         receive_frames();
         display_camera();
         display_model();
         display_drive();
+        display_audio();
     }
 };
 
