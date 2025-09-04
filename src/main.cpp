@@ -328,11 +328,14 @@ struct AudioFeed
     const char* source = "rtp://0.0.0.0:4444";
     std::vector<float> waveform;
     std::vector<float> spectrum;
+    std::queue<std::vector<int16_t>> playback_queue;
     std::mutex audio_mutex;
+    std::mutex playback_mutex;
     int sample_rate = 8000;  // Match your FFmpeg streaming rate
     static constexpr int buffer_size = 8000;  // 1 second of audio at 8kHz
     static constexpr int fft_size = 512;
     int write_pos = 0;
+    bool enable_playback = true;
     
     // update initial params in constructor using initial params
     AudioFeed() 
@@ -379,63 +382,67 @@ void audio_receive_thread(AudioFeed* audio)
                 while (avcodec_receive_frame(codec_context, frame) == 0) {
                     // Process audio frame
                     int samples_per_channel = frame->nb_samples;
-                    // printf("samples_per_channel: %i", frame->nb_samples);
+                    std::vector<int16_t> playback_samples;
                     
-                    // Convert audio data to float and store in circular buffer
-                    {
-                        std::lock_guard<std::mutex> lock(audio->audio_mutex);
+                    for (int i = 0; i < samples_per_channel; i++) {
+                        float sample = 0.0f;
+                        int16_t playback_sample = 0;
+
+                        // Handle different audio formats
+                        if (frame->format == AV_SAMPLE_FMT_S16P) {
+                            int16_t* data = (int16_t*)frame->data[0];
+                            playback_sample = data[i];
+                            sample = data[i] / 32768.0f;
+                        }
                         
-                        for (int i = 0; i < samples_per_channel; i++) {
-                            float sample = 0.0f;
-                            printf("format: %i", frame->format);
-                            // Handle different audio formats
-                            if (frame->format == AV_SAMPLE_FMT_S16P) {
-                                int16_t* data = (int16_t*)frame->data[0];
-                                sample = data[i] / 32768.0f;
-                            } else if (frame->format == AV_SAMPLE_FMT_S16) {
-                                int16_t* data = (int16_t*)frame->data[0];
-                                sample = data[i] / 32768.0f;
-                            } else if (frame->format == AV_SAMPLE_FMT_S32) {
-                                int32_t* data = (int32_t*)frame->data[0];
-                                sample = data[i] / 2147483648.0f;
-                            } else if (frame->format == AV_SAMPLE_FMT_FLT) {
-                                float* data = (float*)frame->data[0];
-                                sample = data[i];
-                            }
-                            
-                            // Store in circular buffer
+                        playback_samples.push_back(playback_sample);
+                        
+                        // Store in visualization buffer
+                        {
+                            std::lock_guard<std::mutex> lock(audio->audio_mutex);
                             audio->waveform[audio->write_pos] = sample;
                             audio->write_pos = (audio->write_pos + 1) % AudioFeed::buffer_size;
                         }
+                    }
+                    
+                    // Add to playback queue
+                    {
+                        std::lock_guard<std::mutex> lock(audio->playback_mutex);
+                        audio->playback_queue.push(playback_samples);
                         
-                        // Calculate spectrum periodically
-                        static int spectrum_counter = 0;
-                        spectrum_counter += samples_per_channel;
-                        if (spectrum_counter >= AudioFeed::fft_size) {
-                            spectrum_counter = 0;
-                            
-                            // Get recent samples for FFT
-                            std::vector<float> fft_input(AudioFeed::fft_size);
-                            for (int i = 0; i < AudioFeed::fft_size; i++) {
-                                int pos = (audio->write_pos - AudioFeed::fft_size + i + AudioFeed::buffer_size) % AudioFeed::buffer_size;
-                                fft_input[i] = audio->waveform[pos];
+                        // Limit queue size to prevent excessive buffering
+                        while (audio->playback_queue.size() > 10) {
+                            audio->playback_queue.pop();
+                        }
+                    }
+                    
+                    // Calculate spectrum periodically
+                    static int spectrum_counter = 0;
+                    spectrum_counter += samples_per_channel;
+                    if (spectrum_counter >= AudioFeed::fft_size) {
+                        spectrum_counter = 0;
+                        
+                        std::lock_guard<std::mutex> lock(audio->audio_mutex);
+                        std::vector<float> fft_input(AudioFeed::fft_size);
+                        for (int i = 0; i < AudioFeed::fft_size; i++) {
+                            int pos = (audio->write_pos - AudioFeed::fft_size + i + AudioFeed::buffer_size) % AudioFeed::buffer_size;
+                            fft_input[i] = audio->waveform[pos];
+                        }
+                        
+                        // simple fft
+                        int n = fft_input.size();
+                        if (n <= 1) return;
+                        
+                        // Simple magnitude spectrum calculation using DFT
+                        audio->spectrum.resize(n / 2);
+                        for (int k = 0; k < n / 2; k++) {
+                            float real = 0, imag = 0;
+                            for (int i = 0; i < n; i++) {
+                                float angle = -2.0f * M_PI * k * i / n;
+                                real += fft_input[i] * cos(angle);
+                                imag += fft_input[i] * sin(angle);
                             }
-                            
-                            // simple fft
-                            int n = fft_input.size();
-                            if (n <= 1) return;
-                            
-                            // Simple magnitude spectrum calculation using DFT
-                            audio->spectrum.resize(n / 2);
-                            for (int k = 0; k < n / 2; k++) {
-                                float real = 0, imag = 0;
-                                for (int i = 0; i < n; i++) {
-                                    float angle = -2.0f * M_PI * k * i / n;
-                                    real += fft_input[i] * cos(angle);
-                                    imag += fft_input[i] * sin(angle);
-                                }
-                                audio->spectrum[k] = sqrt(real * real + imag * imag);
-                            }
+                            audio->spectrum[k] = sqrt(real * real + imag * imag);
                         }
                     }
                 }
@@ -451,6 +458,60 @@ void audio_receive_thread(AudioFeed* audio)
     avformat_close_input(&format_context);
     
     printf("Audio stream stopped\n");
+}
+
+void audio_playback_thread(AudioFeed* audio) 
+{
+    // Set up PulseAudio for playback
+    int const sample_rate = 8000;
+
+    pa_sample_spec sample_spec = {
+        .format = PA_SAMPLE_S16LE,
+        .rate = sample_rate,  // Match your stream rate
+        .channels = 1  // Mono
+    };
+    
+    int error = 0;
+    pa_simple* conn = pa_simple_new(
+        0,           // Server
+        "TurtleGUI",      // Application name
+        PA_STREAM_PLAYBACK, // Direction
+        audio->source,          // Device
+        "Audio Playback", // Stream description
+        &sample_spec,     // Sample format
+        0,          // Channel map
+        0,          // Buffering attributes
+        &error            // Error code
+    );
+    assert(conn);
+
+    printf("Audio playback thread started\n");
+    
+    while (true) {
+        std::vector<int16_t> audio_chunk;
+        
+        // Get audio data from queue
+        {
+            std::lock_guard<std::mutex> lock(audio->playback_mutex);
+            if (!audio->playback_queue.empty() && audio->enable_playback) {
+                audio_chunk = audio->playback_queue.front();
+                audio->playback_queue.pop();
+            }
+        }
+        
+        if (!audio_chunk.empty()) {
+            // Play audio
+            if (pa_simple_write(conn, audio_chunk.data(), 
+                               audio_chunk.size() * sizeof(int16_t), &error) < 0) {
+                printf("PulseAudio write error!");
+            }
+        } else {
+            // Sleep briefly if no audio to play
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    
+    pa_simple_free(conn);
 }
 
 class Turtle
@@ -494,6 +555,11 @@ public:
     void start_audio_thread() {
         std::thread audio(audio_receive_thread, &audio_feed);
         audio.detach();
+    }
+
+    void start_audio_playback_thread() {
+        std::thread playback(audio_playback_thread, &audio_feed);
+        playback.detach();
     }
 
     void receive_frames() {
@@ -736,6 +802,17 @@ public:
         // Audio info
         ImGui::Text("Sample Rate: %d Hz", audio_feed.sample_rate);
         ImGui::Text("Buffer Size: %d samples", AudioFeed::buffer_size);
+
+        // Playback controls
+        ImGui::Checkbox("Enable Audio Playback", &audio_feed.enable_playback);
+        
+        // Queue status
+        int queue_size = 0;
+        {
+            std::lock_guard<std::mutex> lock(audio_feed.playback_mutex);
+            queue_size = audio_feed.playback_queue.size();
+        }
+        ImGui::Text("Playback Queue: %d chunks", queue_size);
         
         ImGui::End();
     }
@@ -773,8 +850,9 @@ int main()
     ImGui_ImplOpenGL3_Init("#version 330"); 
 
     Turtle turtle;
-    // turtle.start_camera_thread();
+    turtle.start_camera_thread();
     turtle.start_audio_thread();
+    turtle.start_audio_playback_thread();
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
